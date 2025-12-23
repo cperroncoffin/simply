@@ -2610,6 +2610,12 @@ def run_experiment(
       metric_log_interval=config.tb_log_interval,
       log_additional_info=config.log_additional_info,
       should_save_ckpt=config.should_save_ckpt,
+      metric_writer_type=config.metric_writer_type,
+      wandb_project=config.wandb_project,
+      wandb_entity=config.wandb_entity,
+      wandb_name=config.wandb_name,
+      wandb_tags=config.wandb_tags,
+      wandb_config=pytree.dump(config),
   )
   model, extra_output = create_model(config, config.sharding_config)
   teacher_model = extra_output.get('teacher')

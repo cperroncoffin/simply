@@ -375,6 +375,14 @@ class BaseExperimentConfig(ExperimentConfig):
   tb_log_interval: int = 100
   log_additional_info: bool = True
 
+  # Metric writer config: 'tensorboard' or 'wandb'
+  metric_writer_type: str = 'wandb'
+  # Wandb-specific config (only used when metric_writer_type='wandb')
+  wandb_project: str = 'my-test-wandb'
+  wandb_entity: str = ''
+  wandb_name: str = 'test-wandb'
+  wandb_tags: tuple[str, ...] = ()
+
   # Config for init from existing checkpoint.
   init_ckpt_dir: str = ''
   init_ckpt_step: int = -1

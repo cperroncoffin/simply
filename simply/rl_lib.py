@@ -55,6 +55,7 @@ from simply.utils import evaluation_lib as eval_lib
 from simply.utils import experiment_helper as exp_helper
 from simply.utils import lm_format as lm_format_lib
 from simply.utils import masked
+from simply.utils import pytree
 from simply.utils import registry
 from simply.utils import replay_buffers
 from simply.utils import sampling_lib
@@ -849,6 +850,12 @@ def run_experiment(
       metric_log_interval=config.tb_log_interval,
       log_additional_info=config.log_additional_info,
       should_save_ckpt=config.should_save_ckpt,
+      metric_writer_type=config.metric_writer_type,
+      wandb_project=config.wandb_project,
+      wandb_entity=config.wandb_entity,
+      wandb_name=config.wandb_name,
+      wandb_tags=config.wandb_tags,
+      wandb_config=pytree.dump(config),
   )
   model, _ = model_lib.create_model(config, config.sharding_config)
   helper.save_config_info(config, config.sharding_config, model)

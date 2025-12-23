@@ -182,7 +182,7 @@ add_c4_task()
 def add_imdb_reviews_task():
   """Adds imdb_reviews tasks."""
   source = seqio.TfdsDataSource(
-      tfds_name='imdb_reviews:1.0.0',
+      tfds_name='imdb_reviews/plain_text:1.0.0',
       splits={
           'train': 'train[:90%]',
           'validation': 'train[90%:]',

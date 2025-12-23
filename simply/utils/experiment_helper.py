@@ -19,7 +19,7 @@ import dataclasses
 import functools
 import json
 import logging
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 from clu import metric_writers
 from etils import epath
@@ -30,6 +30,100 @@ from simply.utils import checkpoint_lib as ckpt_lib
 from simply.utils import common
 from simply.utils import pytree
 import yaml
+
+
+class MetricWriter(Protocol):
+  """Protocol for metric writers."""
+
+  def write_scalars(self, step: int, scalars: Mapping[str, Any]) -> None:
+    ...
+
+  def write_texts(self, step: int, texts: Mapping[str, str]) -> None:
+    ...
+
+  def flush(self) -> None:
+    ...
+
+  def close(self) -> None:
+    ...
+
+
+class WandbMetricWriter:
+  """Weights & Biases metric writer.
+
+  This class provides an interface compatible with clu.metric_writers
+  for logging to Weights & Biases.
+  """
+
+  def __init__(
+      self,
+      project: str = '',
+      entity: str = '',
+      name: str = '',
+      tags: Sequence[str] = (),
+      config: Mapping[str, Any] | None = None,
+      dir: str | None = None,
+  ):
+    """Initialize wandb run.
+
+    Args:
+      project: W&B project name. If empty, uses WANDB_PROJECT env var.
+      entity: W&B entity (username or team). If empty, uses default.
+      name: Run name. If empty, wandb generates one.
+      tags: List of tags for the run.
+      config: Configuration dict to log.
+      dir: Directory to store wandb files.
+    """
+    try:
+      import wandb
+    except ImportError:
+      raise ImportError(
+          'wandb is required for WandbMetricWriter. '
+          'Install it with: pip install wandb'
+      )
+
+    self._wandb = wandb
+
+    init_kwargs = {}
+    if project:
+      init_kwargs['project'] = project
+    if entity:
+      init_kwargs['entity'] = entity
+    if name:
+      init_kwargs['name'] = name
+    if tags:
+      init_kwargs['tags'] = list(tags)
+    if config:
+      init_kwargs['config'] = dict(config)
+    if dir:
+      init_kwargs['dir'] = dir
+
+    self._run = wandb.init(**init_kwargs)
+    logging.info('Initialized wandb run: %s', self._run.name)
+
+  def write_scalars(self, step: int, scalars: Mapping[str, Any]) -> None:
+    """Log scalar metrics to wandb."""
+    # Convert numpy arrays to Python scalars
+    logged_scalars = {}
+    for k, v in scalars.items():
+      if isinstance(v, np.ndarray):
+        v = v.item() if v.size == 1 else float(v.mean())
+      logged_scalars[k] = v
+    self._wandb.log(logged_scalars, step=step)
+
+  def write_texts(self, step: int, texts: Mapping[str, str]) -> None:
+    """Log text to wandb as a table or summary."""
+    for key, text in texts.items():
+      # Log as wandb summary for text data
+      self._run.summary[key] = text
+
+  def flush(self) -> None:
+    """Flush is a no-op for wandb (it handles this automatically)."""
+    pass
+
+  def close(self) -> None:
+    """Finish the wandb run."""
+    self._wandb.finish()
 
 
 def is_primary_process() -> bool:
@@ -65,6 +159,13 @@ class ExperimentHelper:
   num_train_steps: int = 0
   log_additional_info: bool = False
   should_save_ckpt: bool = True
+  # Metric writer configuration
+  metric_writer_type: str = 'wandb'  # 'tensorboard' or 'wandb'
+  wandb_project: str = ''
+  wandb_entity: str = ''
+  wandb_name: str = ''
+  wandb_tags: tuple[str, ...] = ()
+  wandb_config: Mapping[str, Any] | None = None
 
   @property
   def should_save_data(self) -> bool:
@@ -134,18 +235,30 @@ class ExperimentHelper:
     return (epath.Path(self.experiment_dir) / 'tb_log').as_posix()
 
   @functools.cached_property
-  def metric_writer(self) -> metric_writers.MetricWriter | None:
-    """Creates a metric writer."""
+  def metric_writer(self) -> MetricWriter | None:
+    """Creates a metric writer based on metric_writer_type."""
     if not self.should_save_data:
       return None
-    metric_logdir = epath.Path(self.metric_logdir)
-    metric_logdir.mkdir(parents=True, exist_ok=True)
-    writer = metric_writers.create_default_writer(
-        logdir=metric_logdir,
-        just_logging=not self.should_save_data,
-        asynchronous=True,
-    )
-    return writer
+
+    if self.metric_writer_type == 'wandb':
+      return WandbMetricWriter(
+          project=self.wandb_project,
+          entity=self.wandb_entity,
+          name=self.wandb_name,
+          tags=self.wandb_tags,
+          config=self.wandb_config,
+          dir=self.experiment_dir,
+      )
+    else:
+      # Default to tensorboard (clu metric_writers)
+      metric_logdir = epath.Path(self.metric_logdir)
+      metric_logdir.mkdir(parents=True, exist_ok=True)
+      writer = metric_writers.create_default_writer(
+          logdir=metric_logdir,
+          just_logging=not self.should_save_data,
+          asynchronous=True,
+      )
+      return writer
 
   @functools.cached_property
   def metrics_aggregator(self) -> 'MetricsAggregator':
