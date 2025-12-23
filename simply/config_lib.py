@@ -364,7 +364,7 @@ class BaseExperimentConfig(ExperimentConfig):
   clip_local_update_rms: float = 1.0
   grad_accum_steps: int = -1
 
-  # Checkpoint and tensorboard config
+  # Checkpoint and logging config
   # should_save_ckpt refers to whether to save any checkpoint. If False,
   # overrides all the other checkpoint configs. If True, the other checkpoint
   # configs come into effect.
@@ -375,9 +375,7 @@ class BaseExperimentConfig(ExperimentConfig):
   tb_log_interval: int = 100
   log_additional_info: bool = True
 
-  # Metric writer config: 'tensorboard' or 'wandb'
-  metric_writer_type: str = 'wandb'
-  # Wandb-specific config (only used when metric_writer_type='wandb')
+  # Wandb config
   wandb_project: str = 'my-test-wandb'
   wandb_entity: str = ''
   wandb_name: str = 'test-wandb'
@@ -536,7 +534,7 @@ def apply_simple_rl(config):
       sampling_prefill_size=1024,
       sampling_max_input_len=1024,
       sampling_intermediate_decode_steps=1024,
-      # Checkpoint and tensorboard configs.
+      # Checkpoint and logging configs.
       init_ckpt_opt_state=False,
       ckpt_max_to_keep=1,
       tb_log_interval=4,
@@ -1070,7 +1068,7 @@ def gemma2_2b_gsm8k_0shot_rl():
           value=1e-7,
           warmup_steps=1,
       ),
-      # Checkpoint and tensorboard configs.
+      # Checkpoint and logging configs.
       init_ckpt_opt_state=False,
       ckpt_max_to_keep=1,
       tb_log_interval=20,
@@ -1253,7 +1251,7 @@ def gemma3_4b_it_simple_qa_number_only_tool_use_rl():
       activation_dtype_name='bfloat16',
       decoding_quant_scheme='bfloat16',
       ref_params_dtype='bfloat16',
-      # Checkpoint and tensorboard configs.
+      # Checkpoint and logging configs.
       init_ckpt_opt_state=False,
       ckpt_max_to_keep=1,
       tb_log_interval=10,
@@ -1375,7 +1373,7 @@ def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl():
           value=1e-6,
           warmup_steps=1,
       ),
-      # Checkpoint and tensorboard configs.
+      # Checkpoint and logging configs.
       init_ckpt_opt_state=False,
       ckpt_max_to_keep=1,
       tb_log_interval=4,
@@ -1425,7 +1423,7 @@ def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2():
       batch_size=64,
       num_samples_per_example=8,
       grad_accum_steps=4,
-      # Checkpoint and tensorboard logging configs.
+      # Checkpoint and logging configs.
       tb_log_interval=1,
       ckpt_interval=20,
       ckpt_max_to_keep=1,
@@ -1875,7 +1873,7 @@ def lm_test():
       validation_num_eval_steps=2,
       validation_eval_interval=5,
       validation_eval_batch_size=-1,
-      # Checkpoint and tensorboard config
+      # Checkpoint and logging config
       ckpt_interval=10,
       ckpt_max_to_keep=3,
       tb_log_interval=2,

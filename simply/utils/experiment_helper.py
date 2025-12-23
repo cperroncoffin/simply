@@ -48,11 +48,7 @@ class MetricWriter(Protocol):
 
 
 class WandbMetricWriter:
-  """Weights & Biases metric writer.
-
-  This class provides an interface compatible with clu.metric_writers
-  for logging to Weights & Biases.
-  """
+  """Weights & Biases metric writer."""
 
   def __init__(
       self,
@@ -158,8 +154,7 @@ class ExperimentHelper:
   num_train_steps: int = 0
   log_additional_info: bool = False
   should_save_ckpt: bool = True
-  # Metric writer configuration
-  metric_writer_type: str = 'wandb'  # 'tensorboard' or 'wandb'
+  # Wandb metric writer configuration
   wandb_project: str = ''
   wandb_entity: str = ''
   wandb_name: str = ''
@@ -229,44 +224,20 @@ class ExperimentHelper:
     if self.should_save_data:
       epath.Path(self.experiment_dir).mkdir(parents=True, exist_ok=True)
 
-  @property
-  def metric_logdir(self) -> str:
-    return (epath.Path(self.experiment_dir) / 'tb_log').as_posix()
-
   @functools.cached_property
   def metric_writer(self) -> MetricWriter | None:
-    """Creates a metric writer based on metric_writer_type."""
+    """Creates a wandb metric writer."""
     if not self.should_save_data:
       return None
 
-    if self.metric_writer_type == 'wandb':
-      return WandbMetricWriter(
-          project=self.wandb_project,
-          entity=self.wandb_entity,
-          name=self.wandb_name,
-          tags=self.wandb_tags,
-          config=self.wandb_config,
-          dir=self.experiment_dir,
-      )
-    else:
-      # Default to tensorboard (clu metric_writers)
-      # Lazy import to avoid TensorFlow dependency when using wandb
-      try:
-        from clu import metric_writers
-      except ImportError:
-        raise ImportError(
-            'clu is required for tensorboard logging. '
-            'Install it with: pip install clu tensorflow. '
-            'Alternatively, use metric_writer_type="wandb" to avoid this dependency.'
-        )
-      metric_logdir = epath.Path(self.metric_logdir)
-      metric_logdir.mkdir(parents=True, exist_ok=True)
-      writer = metric_writers.create_default_writer(
-          logdir=metric_logdir,
-          just_logging=not self.should_save_data,
-          asynchronous=True,
-      )
-      return writer
+    return WandbMetricWriter(
+        project=self.wandb_project,
+        entity=self.wandb_entity,
+        name=self.wandb_name,
+        tags=self.wandb_tags,
+        config=self.wandb_config,
+        dir=self.experiment_dir,
+    )
 
   @functools.cached_property
   def metrics_aggregator(self) -> 'MetricsAggregator':

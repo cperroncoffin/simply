@@ -2,7 +2,6 @@ orbax
 grain
 einops
 absl-py
-tensorboard
 sentencepiece
 datasets
 pyarrow

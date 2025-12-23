@@ -30,9 +30,6 @@ python -m simply.main --experiment_config lm_test --experiment_dir /tmp/exp_1 --
 # Debug mode (disable JIT for printing arrays)
 export JAX_DISABLE_JIT=True
 python -m simply.main --experiment_config lm_no_scan_test --experiment_dir /tmp/exp_1 --alsologtostderr
-
-# TensorBoard monitoring
-tensorboard --logdir /tmp/exp_1
 ```
 
 ### Testing

@@ -34,6 +34,3 @@ pip install -r requirements.txt
 # Add "export JAX_DISABLE_JIT=True;" to disable `jit` for easier debugging.
 # Change "lm_test" to other experiment config names in `config_lib.py` to run other experiments.
 EXP=local_test_1; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config lm_test --experiment_dir /tmp/${EXP} --alsologtostderr
-
-# Example command for checking learning curves with tensorboard.
-tensorboard --logdir /tmp/${EXP}

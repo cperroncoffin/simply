@@ -66,7 +66,7 @@ def lm_test():
       ),
       clip_grad_norm=1.0,
       clip_update_norm=1.0,
-      # Checkpoint and tensorboard config
+      # Checkpoint and logging config
       ckpt_interval=10,
       ckpt_max_to_keep=3,
       tb_log_interval=2,
