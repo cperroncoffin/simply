@@ -53,7 +53,7 @@ pytest simply/model_lib_test.py::ModelTest::test_forward_pass
 - **main.py** - Entry point for training runs
 - **config_lib.py** - Experiment and sharding configurations via registries
 - **model_lib.py** - LLM architectures (Attention, TransformerBlock, TransformerLM, MoE)
-- **data_lib.py** - Data pipeline setup using SeqIO and Grain
+- **data_lib.py** - Data pipeline setup using Grain
 - **rl_lib.py** - RL training components (reward normalization, batching)
 - **tool_lib.py** - Tool use and execution framework
 

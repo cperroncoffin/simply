@@ -18,7 +18,7 @@ import dataclasses
 import functools
 import json
 import os
-from typing import Callable, ClassVar, Mapping, MutableMapping, Protocol, Union
+from typing import Any, Callable, ClassVar, Iterator, Mapping, MutableMapping, Protocol, Union
 
 import einops
 from etils import epath
@@ -26,13 +26,11 @@ import grain.python as grain
 import jax
 import jax.numpy as jnp
 import numpy as np
-import seqio
 from simply.utils import common
 from simply.utils import registry
-from simply.utils import seqio_wrapper
 from simply.utils import tokenization
-import t5.data.preprocessors
 import tensorflow as tf
+import tensorflow_datasets as tfds
 
 ################################################################################
 # Type aliases.
@@ -75,12 +73,12 @@ def register_vocabs():
       OPENMIX_V3_VOCABS + GEMMA2_VOCABS)
   for name, vocab_path in vocabs:
     tokenization.TokenizerRegistry.register_value(
-        seqio.SentencePieceVocabulary(vocab_path), name=name)
+        tokenization.SentencePieceVocabulary(vocab_path), name=name)
 
 register_vocabs()
 
 tokenization.TokenizerRegistry.register_value(
-    seqio.SentencePieceVocabulary(GEMMA3_VOCAB), name='vb262144_gemma3'
+    tokenization.SentencePieceVocabulary(GEMMA3_VOCAB), name='vb262144_gemma3'
 )
 
 tokenization.TokenizerRegistry.register_value(
@@ -107,256 +105,417 @@ END_OF_MESSAGE_TOKEN = '<reserved_4>'
 
 
 ################################################################################
-# PT datasets.
+# Grain-based Dataset Configurations and Transforms.
 
 
-def add_pt_task_v1(name, source, vocab, add_eos=False,
-                   use_reduce_concat_split=True):
-  preprocessors = [
-      functools.partial(
-          t5.data.preprocessors.rekey,
-          key_map={
-              'inputs': None,
-              'targets': 'text',
-          },
-      ),
-      seqio.preprocessors.tokenize,
-      # Note that append_eos will respect the `add_eos`` field in
-      # `output_features``.
-      seqio.preprocessors.append_eos,
-  ]
-  if use_reduce_concat_split:
-    preprocessors += [
-        t5.data.preprocessors.reduce_concat_tokens,
-        t5.data.preprocessors.split_tokens_to_targets_length,
-    ]
-  seqio.TaskRegistry.remove(name)
-  seqio.TaskRegistry.add(
-      name,
-      source=source,
-      preprocessors=preprocessors,
-      output_features={
-          'targets': seqio.Feature(
-              seqio.SentencePieceVocabulary(vocab),
-              add_eos=add_eos, dtype=tf.int32
-              ),
-          },
-  )
+@dataclasses.dataclass(frozen=True)
+class DatasetConfig:
+  """Configuration for a dataset."""
+  vocab_name: str
+  vocab_path: str
+  seq_len: int = 1024
+  add_eos: bool = False
+  add_bos: bool = False
+  use_packing: bool = False
 
 
-def add_lm1b_task():
-  lm1b_source = seqio.TfdsDataSource(
-      tfds_name='lm1b:1.1.0',
-      splits={
-          'train': 'train[:90%]',
-          'validation': 'train[90%:]',
-          'test': 'test'})
-  minilm1b_source = seqio.TfdsDataSource(
-      tfds_name='lm1b:1.1.0',
-      splits={
-          'train': 'train[:500]',
-          'validation': 'train[500:1000]',
-          'test': 'test'})
-  vocabs = OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS
-  vocabs += [('vb32768_openmix_v1', OPENMIX_V1_32768_VOCAB)]
-  for name, source in [('lm1b', lm1b_source),
-                       ('minilm1b', minilm1b_source)]:
-    for vocab_name, vocab in vocabs:
-      task_name = f'{name}.{vocab_name}'
-      add_pt_task_v1(task_name, source, vocab,
-                     use_reduce_concat_split=False)
+class TokenizeTransform(grain.MapTransform):
+  """Tokenizes text using a SentencePiece tokenizer."""
 
-add_lm1b_task()
+  def __init__(
+      self, vocab: tokenization.SentencePieceVocabulary,
+      text_key: str = 'text',
+      add_eos: bool = False,
+      add_bos: bool = False):
+    self.vocab = vocab
+    self.text_key = text_key
+    self.add_eos = add_eos
+    self.add_bos = add_bos
 
-
-def add_c4_task():
-  source = seqio.TfdsDataSource(tfds_name='c4:3.0.1')
-  vocabs = OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS
-  for vocab_name, vocab in vocabs:
-    task_name = f'c4.{vocab_name}'
-    add_pt_task_v1(task_name, source, vocab,
-                   use_reduce_concat_split=True)
-add_c4_task()
+  def map(self, features: dict[str, Any]) -> dict[str, Any]:
+    text = features[self.text_key]
+    if isinstance(text, bytes):
+      text = text.decode('utf-8')
+    tokens = self.vocab.encode(text)
+    if self.add_bos and self.vocab.bos_id is not None:
+      tokens = [self.vocab.bos_id] + tokens
+    if self.add_eos and self.vocab.eos_id is not None:
+      tokens = tokens + [self.vocab.eos_id]
+    return {'targets': np.array(tokens, dtype=np.int32)}
 
 
-def add_imdb_reviews_task():
-  """Adds imdb_reviews tasks."""
-  source = seqio.TfdsDataSource(
-      tfds_name='imdb_reviews/plain_text:1.0.0',
-      splits={
-          'train': 'train[:90%]',
-          'validation': 'train[90%:]',
-          'test': 'test'})
-  name = 'imdb_reviews'
-  for vocab_name, vocab in T5_CC_VOCABS:
-    task_name = f'{name}.{vocab_name}'
-    add_pt_task_v1(task_name, source, vocab,
-                   use_reduce_concat_split=False)
+class LMFeatureConverter(grain.MapTransform):
+  """Converts tokenized examples to LM format with inputs/targets shift."""
 
-add_imdb_reviews_task()
+  def __init__(self, seq_len: int, bos_id: int = 0):
+    self.seq_len = seq_len
+    self.bos_id = bos_id
 
+  def map(self, features: dict[str, Any]) -> dict[str, Any]:
+    targets = features['targets']
+    # Pad or truncate to seq_len + 1 (to create input/target pairs)
+    if len(targets) > self.seq_len:
+      targets = targets[:self.seq_len]
+    elif len(targets) < self.seq_len:
+      padding = np.zeros(self.seq_len - len(targets), dtype=np.int32)
+      targets = np.concatenate([targets, padding])
 
-def add_pile_tasks():
-  the_pile_train = os.path.join(DATASETS_DIR, 'pile/pile_tfrecord/train.tfrecord*')
-  the_pile_validation = os.path.join(DATASETS_DIR, 'pile/pile_tfrecord/val.tfrecord*')
-  the_pile_test = os.path.join(DATASETS_DIR, 'pile/pile_tfrecord/test.tfrecord*')
-  the_pile_source = seqio.TFExampleDataSource(
-      split_to_filepattern={
-          'train': the_pile_train,
-          'validation': the_pile_validation,
-          'test': the_pile_test},
-      feature_description={
-          'text': tf.io.FixedLenFeature([], dtype=tf.string),
-          'source': tf.io.FixedLenFeature([], dtype=tf.string)})
-  for vocab_name, vocab in PILE_VOCABS:
-    task_name = f'the_pile_lm.{vocab_name}'
-    add_pt_task_v1(task_name, the_pile_source, vocab)
+    # Create decoder_input_tokens with BOS prepended and decoder_target_tokens
+    decoder_input_tokens = np.concatenate([[self.bos_id], targets[:-1]])
+    decoder_target_tokens = targets
+    decoder_loss_weights = (decoder_target_tokens != 0).astype(np.float32)
 
-add_pile_tasks()
-
-
-# Add redpajama_1t datasets.
-def add_redpajama_1t_task():
-  for cat in ['arxiv', 'wikipedia', 'book', 'stackexchange']:
-    path = os.path.join(DATASETS_DIR, f'redpajama_1t/tfrecord/{cat}.tfrecord*')
-    source = seqio.TFExampleDataSource(
-        split_to_filepattern={'train': path},
-        feature_description={
-            'text': tf.io.FixedLenFeature([], dtype=tf.string)})
-    for vocab_name, vocab in (OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS +
-                              OPENMIX_V3_VOCABS):
-      task_name = f'redpajama_1t_{cat}.{vocab_name}'
-      add_pt_task_v1(task_name, source, vocab)
-
-add_redpajama_1t_task()
-
-
-# Add starcoder datasets
-def add_starcoder_task():
-  path = os.path.join(DATASETS_DIR, 'starcoder/tfrecord/train.tfrecord*')
-  source = seqio.TFExampleDataSource(
-      split_to_filepattern={'train': path},
-      feature_description={
-          'text': tf.io.FixedLenFeature([], dtype=tf.string)})
-  for vocab_name, vocab in OPENMIX_V1_VOCABS:
-    task_name = f'starcoder.{vocab_name}'
-    add_pt_task_v1(task_name, source, vocab)
-add_starcoder_task()
-
-
-# Add refinedweb datasets
-def add_refinedweb_task():
-  path = os.path.join(DATASETS_DIR, 'refinedweb/tfrecord/train.tfrecord*')
-  source = seqio.TFExampleDataSource(
-      split_to_filepattern={'train': path},
-      feature_description={
-          'text': tf.io.FixedLenFeature([], dtype=tf.string)})
-  for vocab_name, vocab in OPENMIX_V1_VOCABS:
-    task_name = f'refinedweb.{vocab_name}'
-    add_pt_task_v1(task_name, source, vocab)
-
-add_refinedweb_task()
-
-
-def add_fineweb_edu_task():
-  path = os.path.join(DATASETS_DIR, 'fineweb-edu/train1.tfrecord-*')
-  source = seqio.TFExampleDataSource(
-      split_to_filepattern={'train': path},
-      feature_description={
-          'text': tf.io.FixedLenFeature([], dtype=tf.string)})
-
-  for vocab_name, vocab in ([
-      ['fwedu_100864_v1', FWEDU_100864_V1_VOCAB]] +
-                            OPENMIX_V1_VOCABS +
-                            OPENMIX_V2_VOCABS):
-    task_name = f'fineweb_edu.{vocab_name}'
-    add_pt_task_v1(task_name, source, vocab)
-
-add_fineweb_edu_task()
-
-
-def add_dclm_baseline_1p0_task():
-  path = os.path.join(DATASETS_DIR, 'dclm-baseline-1p0/tfrecords/*/*')
-  source = seqio.TFExampleDataSource(
-      split_to_filepattern={'train': path},
-      feature_description={
-          'text': tf.io.FixedLenFeature([], dtype=tf.string)})
-
-  for vocab_name, vocab in (OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS +
-                            OPENMIX_V3_VOCABS):
-    task_name = f'dclm_baseline_1p0.{vocab_name}'
-    add_pt_task_v1(task_name, source, vocab)
-
-add_dclm_baseline_1p0_task()
-
-
-def add_stack_v2_smol_task():
-  repo_version_path = os.path.join(DATASETS_DIR, 'stack_v2/download/train-smol-1/train1.tfrecord*')
-  file_version_path = os.path.join(DATASETS_DIR, 'stack_v2/download/train-smol-1-file/train2.tfrecord*')
-  for name, path in [('stack_v2_smol_repo', repo_version_path),
-                     ('stack_v2_smol_file', file_version_path)]:
-    source = seqio.TFExampleDataSource(
-        split_to_filepattern={'train': path},
-        feature_description={
-            'text': tf.io.FixedLenFeature([], dtype=tf.string)})
-    for vocab_name, vocab in (OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS):
-      task_name = f'{name}.{vocab_name}'
-      add_pt_task_v1(task_name, source, vocab)
-
-add_stack_v2_smol_task()
+    return {
+        'decoder_input_tokens': decoder_input_tokens.astype(np.int32),
+        'decoder_target_tokens': decoder_target_tokens.astype(np.int32),
+        'decoder_loss_weights': decoder_loss_weights,
+    }
 
 
 ################################################################################
-# SFT datasets.
+# Grain-based Data Sources.
 
 
-def converation_preprocessor(
-    dataset: tf.data.Dataset, fn: Callable[..., str]) -> tf.data.Dataset:
+class TFDSDataSource:
+  """Grain-compatible data source for TensorFlow Datasets."""
 
-  @seqio.map_over_dataset
-  def construct_conversation_map(
-      ex: Mapping[str, tf.Tensor]) -> Mapping[str, tf.Tensor]:
-    def py_func(json_str):
-      serialized_conversation = json_str.numpy().decode('utf-8')
-      return fn(serialized_conversation)
-    result_tensor = tf.py_function(
-        func=py_func, inp=[ex['conversation']], Tout=tf.string)
-    result_tensor.set_shape([])
+  def __init__(
+      self,
+      tfds_name: str,
+      split: str = 'train',
+      text_key: str = 'text',
+      data_dir: str | None = None,
+  ):
+    self.tfds_name = tfds_name
+    self.split = split
+    self.text_key = text_key
+    self.data_dir = data_dir
+    self._dataset = None
+    self._length = None
+
+  def _load_dataset(self):
+    if self._dataset is None:
+      self._dataset = tfds.load(
+          self.tfds_name,
+          split=self.split,
+          data_dir=self.data_dir,
+          shuffle_files=False,
+      )
+      # Get length
+      self._length = self._dataset.cardinality().numpy()
+      if self._length == tf.data.UNKNOWN_CARDINALITY:
+        # Count manually if cardinality is unknown
+        self._length = sum(1 for _ in self._dataset)
+
+  def __len__(self) -> int:
+    self._load_dataset()
+    return self._length
+
+  def __getitem__(self, index: int) -> dict[str, Any]:
+    self._load_dataset()
+    # Skip to the index and get one element
+    element = next(iter(self._dataset.skip(index).take(1)))
+    return {self.text_key: element[self.text_key].numpy()}
+
+
+class TFRecordDataSource:
+  """Grain-compatible data source for TFRecord files."""
+
+  def __init__(
+      self,
+      file_pattern: str,
+      feature_description: dict[str, tf.io.FixedLenFeature],
+      text_key: str = 'text',
+  ):
+    self.file_pattern = file_pattern
+    self.feature_description = feature_description
+    self.text_key = text_key
+    self._files = None
+    self._dataset = None
+    self._length = None
+
+  def _load_dataset(self):
+    if self._dataset is None:
+      self._files = tf.io.gfile.glob(self.file_pattern)
+      self._dataset = tf.data.TFRecordDataset(self._files)
+      # Get length
+      self._length = self._dataset.cardinality().numpy()
+      if self._length == tf.data.UNKNOWN_CARDINALITY:
+        # Count manually if cardinality is unknown
+        self._length = sum(1 for _ in self._dataset)
+
+  def __len__(self) -> int:
+    self._load_dataset()
+    return self._length
+
+  def __getitem__(self, index: int) -> dict[str, Any]:
+    self._load_dataset()
+    # Skip to the index and get one element
+    raw_record = next(iter(self._dataset.skip(index).take(1)))
+    parsed = tf.io.parse_single_example(raw_record, self.feature_description)
+    return {self.text_key: parsed[self.text_key].numpy()}
+
+
+class TFDataIterDataset(grain.IterDataset[dict[str, Any]]):
+  """Wraps a tf.data.Dataset as a Grain IterDataset for efficient streaming."""
+
+  def __init__(
+      self,
+      create_tf_dataset_fn: Callable[[], tf.data.Dataset],
+      vocab: tokenization.SentencePieceVocabulary,
+      seq_len: int,
+      batch_size: int,
+      bos_id: int = 0,
+      add_eos: bool = False,
+      shuffle: bool = True,
+      seed: int | None = None,
+      num_epochs: int | None = None,
+  ):
+    super().__init__()
+    self._create_tf_dataset_fn = create_tf_dataset_fn
+    self._vocab = vocab
+    self._seq_len = seq_len
+    self._batch_size = batch_size
+    self._bos_id = bos_id
+    self._add_eos = add_eos
+    self._shuffle = shuffle
+    self._seed = seed
+    self._num_epochs = num_epochs
+    self._num_workers = 1
+    self._worker_index = 0
+
+  def set_slice(self, sl: slice, sequential_slice: bool = False) -> None:
+    del sequential_slice
+    assert sl.stop is None, f'{sl=}'
+    self._num_workers = sl.step
+    self._worker_index = sl.start
+
+  def __iter__(self) -> Iterator[dict[str, Any]]:
+    return _TFDataIterator(
+        create_tf_dataset_fn=self._create_tf_dataset_fn,
+        vocab=self._vocab,
+        seq_len=self._seq_len,
+        batch_size=self._batch_size,
+        bos_id=self._bos_id,
+        add_eos=self._add_eos,
+        shuffle=self._shuffle,
+        seed=self._seed,
+        num_epochs=self._num_epochs,
+        worker_index=self._worker_index,
+        num_workers=self._num_workers,
+    )
+
+
+class _TFDataIterator(grain.DatasetIterator[dict[str, Any]]):
+  """Iterator for TFDataIterDataset."""
+
+  def __init__(
+      self,
+      create_tf_dataset_fn: Callable[[], tf.data.Dataset],
+      vocab: tokenization.SentencePieceVocabulary,
+      seq_len: int,
+      batch_size: int,
+      bos_id: int = 0,
+      add_eos: bool = False,
+      shuffle: bool = True,
+      seed: int | None = None,
+      num_epochs: int | None = None,
+      worker_index: int = 0,
+      num_workers: int = 1,
+  ):
+    super().__init__()
+    self._create_tf_dataset_fn = create_tf_dataset_fn
+    self._vocab = vocab
+    self._seq_len = seq_len
+    self._batch_size = batch_size
+    self._bos_id = bos_id
+    self._add_eos = add_eos
+    self._shuffle = shuffle
+    self._seed = seed
+    self._num_epochs = num_epochs
+    self._worker_index = worker_index
+    self._num_workers = num_workers
+    self._iterator = None
+    self._example_counter = 0
+
+  def _tokenize_and_convert(self, example: dict[str, tf.Tensor]) -> dict[str, tf.Tensor]:
+    """Tokenize text and convert to LM format."""
+    def py_tokenize(text_bytes):
+      text = text_bytes.numpy().decode('utf-8')
+      tokens = self._vocab.encode(text)
+      if self._add_eos and self._vocab.eos_id is not None:
+        tokens = tokens + [self._vocab.eos_id]
+      return np.array(tokens, dtype=np.int32)
+
+    tokens = tf.py_function(py_tokenize, [example['text']], tf.int32)
+    return {'targets': tokens}
+
+  def _pad_and_convert_to_lm(self, example: dict[str, tf.Tensor]) -> dict[str, tf.Tensor]:
+    """Pad/truncate and convert to LM format."""
+    targets = example['targets']
+    # Truncate or pad
+    targets = targets[:self._seq_len]
+    padding = tf.zeros([self._seq_len - tf.shape(targets)[0]], dtype=tf.int32)
+    targets = tf.concat([targets, padding], axis=0)
+    targets.set_shape([self._seq_len])
+
+    # Create decoder format
+    decoder_input_tokens = tf.concat([[self._bos_id], targets[:-1]], axis=0)
+    decoder_target_tokens = targets
+    decoder_loss_weights = tf.cast(decoder_target_tokens != 0, tf.float32)
+
     return {
-        'conversation': result_tensor,
+        'decoder_input_tokens': decoder_input_tokens,
+        'decoder_target_tokens': decoder_target_tokens,
+        'decoder_loss_weights': decoder_loss_weights,
     }
-  return construct_conversation_map(dataset)
+
+  def _create_iterator(self):
+    ds = self._create_tf_dataset_fn()
+
+    # Shard across workers
+    if self._num_workers > 1:
+      ds = ds.shard(num_shards=self._num_workers, index=self._worker_index)
+
+    # Shuffle if requested
+    if self._shuffle:
+      seed = self._seed if self._seed is not None else 42
+      ds = ds.shuffle(buffer_size=10000, seed=seed + self._worker_index)
+
+    # Repeat for epochs
+    if self._num_epochs is None:
+      ds = ds.repeat()
+    else:
+      ds = ds.repeat(self._num_epochs)
+
+    # Tokenize and convert to LM format
+    ds = ds.map(self._tokenize_and_convert, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.map(self._pad_and_convert_to_lm, num_parallel_calls=tf.data.AUTOTUNE)
+
+    # Batch
+    ds = ds.batch(self._batch_size, drop_remainder=True)
+
+    # Prefetch
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+
+    # Disable autotune for multiprocessing compatibility
+    options = tf.data.Options()
+    options.autotune.enabled = False
+    options.threading.max_intra_op_parallelism = 1
+    options.threading.private_threadpool_size = 1
+    ds = ds.with_options(options)
+
+    return iter(ds.as_numpy_iterator())
+
+  def __next__(self) -> dict[str, Any]:
+    if self._iterator is None:
+      self._iterator = self._create_iterator()
+      # Skip to restore position
+      for _ in range(self._example_counter):
+        next(self._iterator)
+
+    self._example_counter += 1
+    return next(self._iterator)
+
+  def get_state(self) -> dict[str, Any]:
+    return {'example_counter': self._example_counter}
+
+  def set_state(self, state: dict[str, Any]) -> None:
+    self._example_counter = state['example_counter']
+    self._iterator = None
 
 
-def add_sft_task_v1(name, source, vocab, conversation_process_fn):
-  seqio.TaskRegistry.remove(name)
-  seqio.TaskRegistry.add(
-      name,
-      source=source,
-      preprocessors=[
-          functools.partial(
-              converation_preprocessor,
-              fn=conversation_process_fn),
-          functools.partial(
-              t5.data.preprocessors.rekey,
-              key_map={
-                  'inputs': None,
-                  'targets': 'conversation',
-              },
-          ),
-          seqio.preprocessors.tokenize,
-          seqio.preprocessors.append_eos,
-          ],
-      output_features={
-          'targets': seqio.Feature(
-              seqio.SentencePieceVocabulary(vocab),
-              add_eos=False, dtype=tf.int32
-              ),
-          },
-  )
+################################################################################
+# Dataset Registry for PT and SFT Datasets.
 
 
-def process_conversation(serialized_conversation):
+def _create_tfds_dataset_fn(tfds_name: str, split: str):
+  """Create a function that returns a tf.data.Dataset from TFDS."""
+  def create_fn():
+    ds = tfds.load(tfds_name, split=split, shuffle_files=False)
+    return ds
+  return create_fn
+
+
+def _create_tfrecord_dataset_fn(
+    file_pattern: str,
+    feature_description: dict[str, tf.io.FixedLenFeature],
+):
+  """Create a function that returns a tf.data.Dataset from TFRecords."""
+  def create_fn():
+    files = tf.io.gfile.glob(file_pattern)
+    ds = tf.data.TFRecordDataset(files)
+    ds = ds.map(
+        lambda x: tf.io.parse_single_example(x, feature_description),
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+    return ds
+  return create_fn
+
+
+# Dataset configurations: maps dataset_name -> (create_fn_factory, vocab_list)
+_DATASET_CONFIGS: dict[str, tuple[Callable, list[tuple[str, str]]]] = {}
+
+
+def _register_tfds_dataset(
+    base_name: str,
+    tfds_name: str,
+    splits: dict[str, str],
+    vocabs: list[tuple[str, str]],
+):
+  """Register a TFDS-based dataset."""
+  for vocab_name, vocab_path in vocabs:
+    dataset_name = f'{base_name}.{vocab_name}'
+    _DATASET_CONFIGS[dataset_name] = (
+        lambda tfds_name=tfds_name, splits=splits: (tfds_name, splits),
+        vocab_path,
+        'tfds',
+    )
+
+
+def _register_tfrecord_dataset(
+    base_name: str,
+    file_patterns: dict[str, str],
+    feature_description: dict[str, tf.io.FixedLenFeature],
+    vocabs: list[tuple[str, str]],
+):
+  """Register a TFRecord-based dataset."""
+  for vocab_name, vocab_path in vocabs:
+    dataset_name = f'{base_name}.{vocab_name}'
+    _DATASET_CONFIGS[dataset_name] = (
+        file_patterns,
+        feature_description,
+        vocab_path,
+        'tfrecord',
+    )
+
+
+# Register TFDS datasets
+_TFDS_DATASETS = [
+    ('lm1b', 'lm1b:1.1.0', {
+        'train': 'train[:90%]',
+        'validation': 'train[90%:]',
+        'test': 'test'
+    }, OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + [('vb32768_openmix_v1', OPENMIX_V1_32768_VOCAB)]),
+    ('minilm1b', 'lm1b:1.1.0', {
+        'train': 'train[:500]',
+        'validation': 'train[500:1000]',
+        'test': 'test'
+    }, OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + [('vb32768_openmix_v1', OPENMIX_V1_32768_VOCAB)]),
+    ('c4', 'c4:3.0.1', {
+        'train': 'train',
+        'validation': 'validation',
+    }, OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS),
+    ('imdb_reviews', 'imdb_reviews/plain_text:1.0.0', {
+        'train': 'train[:90%]',
+        'validation': 'train[90%:]',
+        'test': 'test'
+    }, T5_CC_VOCABS),
+]
+
+
+def process_conversation(serialized_conversation: str) -> str:
+  """Process a serialized conversation into a single text string."""
   conversation = json.loads(serialized_conversation)
   text = []
   role_token_dict = {
@@ -369,36 +528,6 @@ def process_conversation(serialized_conversation):
     text.append(f'{role_token_dict[role]}{content}{END_OF_MESSAGE_TOKEN}')
   return ''.join(text)
 
-
-def add_openhermes_2p5_task():
-  train = os.path.join(DATASETS_DIR, 'openhermes-2p5/train.tfrecord')
-  source = seqio.TFExampleDataSource(
-      split_to_filepattern={'train': train},
-      feature_description={
-          'conversation': tf.io.FixedLenFeature([], dtype=tf.string),
-          'metadata': tf.io.FixedLenFeature([], dtype=tf.string)})
-  for vocab_name, vocab in (
-      OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS):
-    add_sft_task_v1(
-        f'openhermes_2p5.{vocab_name}', source, vocab,
-        conversation_process_fn=process_conversation)
-
-add_openhermes_2p5_task()
-
-
-def add_tulu_v2_task():
-  train = os.path.join(DATASETS_DIR, 'tulu-v2-sft-mixture/train.tfrecord')
-  source = seqio.TFExampleDataSource(
-      split_to_filepattern={'train': train},
-      feature_description={
-          'conversation': tf.io.FixedLenFeature([], dtype=tf.string),
-          'metadata': tf.io.FixedLenFeature([], dtype=tf.string)})
-  for vocab_name, vocab in OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS:
-    add_sft_task_v1(
-        f'tulu_v2_sft.{vocab_name}', source, vocab,
-        conversation_process_fn=process_conversation)
-
-add_tulu_v2_task()
 
 ################################################################################
 # Mixtures.
@@ -661,80 +790,164 @@ def create_simple_dataset(
   )
 
 
-# class TokenizeTransform(grain.MapTransform):
-#   """Tokenizes text using a given tokenizer.
+def _get_dataset_info(dataset_name: str) -> tuple[str, str, str, dict[str, str]]:
+  """Parse dataset name and return (base_name, vocab_name, ds_type, splits).
 
-#   This is a custom transform that can use any tokenizer (e.g., SentencePiece).
-#   """
+  Dataset name format: <base_name>.<vocab_name>
+  Returns: base_name, vocab_name, dataset_type ('tfds' or 'tfrecord'), splits
+  """
+  parts = dataset_name.rsplit('.', 1)
+  if len(parts) != 2:
+    raise ValueError(f'Invalid dataset name format: {dataset_name}. '
+                     'Expected format: <base_name>.<vocab_name>')
+  base_name, vocab_name = parts
 
-#   def __init__(self, tokenizer, text_key='text', output_key='tokens',):
-#     self.tokenizer = tokenizer
-#     self.text_key = text_key
-#     self.output_key = output_key
+  # Check TFDS datasets
+  for name, tfds_name, splits, vocabs in _TFDS_DATASETS:
+    for vname, _ in vocabs:
+      if name == base_name and vname == vocab_name:
+        return base_name, vocab_name, 'tfds', tfds_name, splits
 
-#   def map(self, features):
-#     """Tokenize the text field."""
-#     text = features[self.text_key]
-#     if isinstance(text, bytes):
-#       text = text.decode('utf-8')
+  # Check TFRecord datasets
+  tfrecord_configs = _get_tfrecord_configs()
+  for name, config in tfrecord_configs.items():
+    if name == base_name:
+      for vname, _ in config['vocabs']:
+        if vname == vocab_name:
+          return base_name, vocab_name, 'tfrecord', config
 
-#     # Tokenize using the provided tokenizer
-#     # For demo purposes, we'll use a simple split - replace with actual tokenizer
-#     tokens = self.tokenizer.encode(text)
-
-#     # Update features with tokenized output
-#     features = dict(features)  # Make a copy
-#     del features[self.text_key]
-#     features[self.output_key] = np.array(tokens, dtype=np.int32)
-#     return features
+  raise ValueError(f'Unknown dataset: {dataset_name}')
 
 
-# def create_grain_dataset(
-#   data_source, tokenizer, batch_size=4, seed=0, seq_len=50,
-#   # num_packing_bins=128,
-#   # mode='concat_then_split',
-#   add_eos=False, add_bos=False
-#   ):
-#   dataset = (
-#       grain.MapDataset.source(data_source)
-#       .shuffle(seed)
-#       .repeat()
-#       # Tokenize text
-#       .map(TokenizeTransform(tokenizer, text_key='text', output_key='tokens'))
-#   )
-#   def add_bos_eos(x):
-#     x = [tokenizer.bos_id] + x
-#     x = x + [tokenizer.eos_id]
-#     return x
-#   if add_eos or add_bos:
-#     dataset.map(lambda x: [tokenizer.bos_id] + x + [tokenizer.eos_id])
-#   dataset = grain.experimental.ConcatThenSplitIterDataset(
-#       parent=dataset,
-#       length_struct={'tokens': seq_len},
-#   )
+def _get_tfrecord_configs() -> dict[str, dict]:
+  """Return TFRecord dataset configurations."""
+  return {
+      'the_pile_lm': {
+          'file_patterns': {
+              'train': os.path.join(DATASETS_DIR, 'pile/pile_tfrecord/train.tfrecord*'),
+              'validation': os.path.join(DATASETS_DIR, 'pile/pile_tfrecord/val.tfrecord*'),
+              'test': os.path.join(DATASETS_DIR, 'pile/pile_tfrecord/test.tfrecord*'),
+          },
+          'feature_description': {
+              'text': tf.io.FixedLenFeature([], dtype=tf.string),
+          },
+          'vocabs': PILE_VOCABS,
+      },
+      'redpajama_1t_arxiv': {
+          'file_patterns': {
+              'train': os.path.join(DATASETS_DIR, 'redpajama_1t/tfrecord/arxiv.tfrecord*'),
+          },
+          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'vocabs': OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS,
+      },
+      'redpajama_1t_wikipedia': {
+          'file_patterns': {
+              'train': os.path.join(DATASETS_DIR, 'redpajama_1t/tfrecord/wikipedia.tfrecord*'),
+          },
+          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'vocabs': OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS,
+      },
+      'redpajama_1t_book': {
+          'file_patterns': {
+              'train': os.path.join(DATASETS_DIR, 'redpajama_1t/tfrecord/book.tfrecord*'),
+          },
+          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'vocabs': OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS,
+      },
+      'redpajama_1t_stackexchange': {
+          'file_patterns': {
+              'train': os.path.join(DATASETS_DIR, 'redpajama_1t/tfrecord/stackexchange.tfrecord*'),
+          },
+          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'vocabs': OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS,
+      },
+      'starcoder': {
+          'file_patterns': {
+              'train': os.path.join(DATASETS_DIR, 'starcoder/tfrecord/train.tfrecord*'),
+          },
+          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'vocabs': OPENMIX_V1_VOCABS,
+      },
+      'refinedweb': {
+          'file_patterns': {
+              'train': os.path.join(DATASETS_DIR, 'refinedweb/tfrecord/train.tfrecord*'),
+          },
+          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'vocabs': OPENMIX_V1_VOCABS,
+      },
+      'fineweb_edu': {
+          'file_patterns': {
+              'train': os.path.join(DATASETS_DIR, 'fineweb-edu/train1.tfrecord-*'),
+          },
+          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'vocabs': [['fwedu_100864_v1', FWEDU_100864_V1_VOCAB]] + OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS,
+      },
+      'dclm_baseline_1p0': {
+          'file_patterns': {
+              'train': os.path.join(DATASETS_DIR, 'dclm-baseline-1p0/tfrecords/*/*'),
+          },
+          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'vocabs': OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS,
+      },
+      'stack_v2_smol_repo': {
+          'file_patterns': {
+              'train': os.path.join(DATASETS_DIR, 'stack_v2/download/train-smol-1/train1.tfrecord*'),
+          },
+          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'vocabs': OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS,
+      },
+      'stack_v2_smol_file': {
+          'file_patterns': {
+              'train': os.path.join(DATASETS_DIR, 'stack_v2/download/train-smol-1-file/train2.tfrecord*'),
+          },
+          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'vocabs': OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS,
+      },
+      'openhermes_2p5': {
+          'file_patterns': {
+              'train': os.path.join(DATASETS_DIR, 'openhermes-2p5/train.tfrecord'),
+          },
+          'feature_description': {
+              'conversation': tf.io.FixedLenFeature([], dtype=tf.string),
+              'metadata': tf.io.FixedLenFeature([], dtype=tf.string),
+          },
+          'vocabs': OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS,
+          'text_key': 'conversation',
+          'text_preprocessor': process_conversation,
+      },
+      'tulu_v2_sft': {
+          'file_patterns': {
+              'train': os.path.join(DATASETS_DIR, 'tulu-v2-sft-mixture/train.tfrecord'),
+          },
+          'feature_description': {
+              'conversation': tf.io.FixedLenFeature([], dtype=tf.string),
+              'metadata': tf.io.FixedLenFeature([], dtype=tf.string),
+          },
+          'vocabs': OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS,
+          'text_key': 'conversation',
+          'text_preprocessor': process_conversation,
+      },
+  }
 
-#   # [bos, a, b, c, eos, bos, b, c, eos]
-#   # [b, c, eos, bos, b,]
-#   # [bos, b, c, eos, b, c, eos]
-#   # # Apply FirstFit packing
-#   # dataset = grain.experimental.FirstFitPackIterDataset(
-#   #     parent=dataset,
-#   #     length_struct={'tokens': seq_len},
-#   #     num_packing_bins=num_packing_bins,
-#   #     shuffle_bins=True,
-#   # )
 
-#   # Batch and prefetch
-#   dataset = dataset.batch(batch_size, drop_remainder=True)
-#   dataset = dataset.mp_prefetch(
-#       grain.MultiprocessingOptions(num_workers=0, per_worker_buffer_size=10)
-#   )
-#   return dataset
+def _get_vocab_path(vocab_name: str, vocabs: list[tuple[str, str]]) -> str:
+  """Get vocab path from vocab name."""
+  for vname, vpath in vocabs:
+    if vname == vocab_name:
+      return vpath
+  raise ValueError(f'Vocab not found: {vocab_name}')
 
 
 def create_iter_dataset(
     config, training: bool = True
 ) -> grain.IterDataset[common.PyTree]:
+  """Create a Grain IterDataset for training or evaluation.
+
+  This function supports:
+  - simply_json:* datasets (JSON-based, uses create_simple_dataset)
+  - TFDS-based datasets (lm1b, c4, imdb_reviews, etc.)
+  - TFRecord-based datasets (pile, redpajama, starcoder, etc.)
+  """
   dataset_name = config.dataset_name
   batch_size = config.batch_size
 
@@ -751,40 +964,102 @@ def create_iter_dataset(
     shuffle = False
     num_epochs = config.validation_eval_epochs
 
+  # Handle simply_json datasets (already Grain-native)
   if dataset_name.startswith('simply_json:'):
     return create_simple_dataset(
         dataset_name, batch_size, config.dataset_seed, shuffle, num_epochs
     )
 
-  if dataset_name.startswith('simply_det:'):
-    seqio_config = seqio_wrapper.SeqIOConfig(
-        dataset_name=dataset_name,
-        feature_converter_name=config.feature_converter_name,
-        batch_size=batch_size,
+  # Parse dataset name
+  base_name, vocab_name, ds_type, *ds_info = _get_dataset_info(dataset_name)
+
+  # Get vocab
+  bos_id = getattr(config, 'bos_id', 0)
+
+  if ds_type == 'tfds':
+    tfds_name, splits = ds_info
+    # Find vocab path
+    for name, tfds_n, sp, vocabs in _TFDS_DATASETS:
+      if name == base_name:
+        vocab_path = _get_vocab_path(vocab_name, vocabs)
+        break
+    vocab = tokenization.SentencePieceVocabulary(vocab_path)
+
+    # Get the split string
+    split_str = splits.get(split, split)
+
+    # Create tf.data.Dataset function
+    def create_tfds_fn(tfds_name=tfds_name, split_str=split_str):
+      return tfds.load(tfds_name, split=split_str, shuffle_files=False)
+
+    dataset = TFDataIterDataset(
+        create_tf_dataset_fn=create_tfds_fn,
+        vocab=vocab,
         seq_len=config.seq_len,
-        split=split,
-        use_packing=config.use_packing,
-        bos_id=getattr(config, 'bos_id', 0),
-        use_cached=True,
-        shuffle=False,
-        num_epochs=1,
-        seed=None,
-    )
-  else:
-    seqio_config = seqio_wrapper.SeqIOConfig(
-        dataset_name=dataset_name,
-        feature_converter_name=config.feature_converter_name,
         batch_size=batch_size,
-        seq_len=config.seq_len,
-        split=split,
-        use_packing=False,
-        bos_id=getattr(config, 'bos_id', 0),
-        use_cached=False,
+        bos_id=bos_id,
+        add_eos=True,
         shuffle=shuffle,
-        num_epochs=num_epochs,
         seed=config.dataset_seed,
+        num_epochs=num_epochs,
     )
-  return seqio_wrapper.SeqIODataset(seqio_config).mp_prefetch(
+
+  elif ds_type == 'tfrecord':
+    tfrecord_config = ds_info[0]
+    vocab_path = _get_vocab_path(vocab_name, tfrecord_config['vocabs'])
+    vocab = tokenization.SentencePieceVocabulary(vocab_path)
+
+    file_pattern = tfrecord_config['file_patterns'].get(split)
+    if file_pattern is None:
+      raise ValueError(f'Split {split} not available for dataset {base_name}')
+
+    feature_description = tfrecord_config['feature_description']
+    text_key = tfrecord_config.get('text_key', 'text')
+    text_preprocessor = tfrecord_config.get('text_preprocessor', None)
+
+    # Create tf.data.Dataset function
+    def create_tfrecord_fn(
+        file_pattern=file_pattern,
+        feature_description=feature_description,
+        text_key=text_key,
+        text_preprocessor=text_preprocessor,
+    ):
+      files = tf.io.gfile.glob(file_pattern)
+      ds = tf.data.TFRecordDataset(files)
+      ds = ds.map(
+          lambda x: tf.io.parse_single_example(x, feature_description),
+          num_parallel_calls=tf.data.AUTOTUNE
+      )
+      # Rename key to 'text' if needed
+      if text_key != 'text':
+        def preprocess(example):
+          text_value = example[text_key]
+          if text_preprocessor is not None:
+            # Apply text preprocessor
+            def py_preprocess(text_bytes):
+              text = text_bytes.numpy().decode('utf-8')
+              return text_preprocessor(text)
+            text_value = tf.py_function(py_preprocess, [text_value], tf.string)
+          return {'text': text_value}
+        ds = ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+      return ds
+
+    dataset = TFDataIterDataset(
+        create_tf_dataset_fn=create_tfrecord_fn,
+        vocab=vocab,
+        seq_len=config.seq_len,
+        batch_size=batch_size,
+        bos_id=bos_id,
+        add_eos=True,
+        shuffle=shuffle,
+        seed=config.dataset_seed,
+        num_epochs=num_epochs,
+    )
+
+  else:
+    raise ValueError(f'Unknown dataset type: {ds_type}')
+
+  return dataset.mp_prefetch(
       grain.MultiprocessingOptions(
           num_workers=config.prefetch_num_workers,
           per_worker_buffer_size=config.prefetch_per_worker_buffer_size,

@@ -1,11 +1,13 @@
 orbax
 grain
-seqio
 einops
 absl-py
 clu
-t5
+tensorflow
 tensorboard
+sentencepiece
+tensorflow-datasets
+tokenizers
 # Following packages are only required for running simply/utils/math_eval.py
 sympy
 pylatexenc

@@ -19,7 +19,7 @@ import json
 from typing import Any, ClassVar, Generic, Protocol, cast
 
 from etils import epath
-import seqio
+import sentencepiece as spm
 from simply.utils import common
 from simply.utils import registry
 import tokenizers
@@ -64,20 +64,109 @@ class TestVocab(SimplyVocab[str]):
     return ' '.join([self._rev_vocab_dict.get(i, '<unk>') for i in token_ids])
 
 
-class SimplySentencePieceVocab(SimplyVocab[str]):
-  """Wrapper around seqio.SentencePieceVocabulary."""
+class SentencePieceVocabulary(SimplyVocab[str]):
+  """SentencePiece vocabulary wrapper.
+
+  This is a drop-in replacement for seqio.SentencePieceVocabulary.
+  """
 
   def __init__(self, vocab_path: str):
-    self._vocab = seqio.SentencePieceVocabulary(vocab_path)
-    self.bos_id = self._vocab.bos_id
-    self.pad_id = self._vocab.pad_id
-    self.eos_id = self._vocab.eos_id
+    self._vocab_path = vocab_path
+    self._sp_model: spm.SentencePieceProcessor | None = None
+
+  @property
+  def sp_model(self) -> spm.SentencePieceProcessor:
+    if self._sp_model is None:
+      self._sp_model = spm.SentencePieceProcessor()
+      self._sp_model.Load(self._vocab_path)
+    return self._sp_model
+
+  @functools.cached_property
+  def vocab_size(self) -> int:
+    return self.sp_model.GetPieceSize()
+
+  @functools.cached_property
+  def bos_id(self) -> int | None:
+    bos_id = self.sp_model.bos_id()
+    return bos_id if bos_id >= 0 else None
+
+  @functools.cached_property
+  def eos_id(self) -> int | None:
+    eos_id = self.sp_model.eos_id()
+    return eos_id if eos_id >= 0 else None
+
+  @functools.cached_property
+  def pad_id(self) -> int | None:
+    pad_id = self.sp_model.pad_id()
+    return pad_id if pad_id >= 0 else None
+
+  @functools.cached_property
+  def unk_id(self) -> int | None:
+    unk_id = self.sp_model.unk_id()
+    return unk_id if unk_id >= 0 else None
 
   def encode(self, text: str) -> list[int]:
-    return self._vocab.encode(text)  # pytype: disable=bad-return-type
+    return self.sp_model.EncodeAsIds(text)
 
   def decode(self, token_ids: list[int]) -> str:
-    return self._vocab.decode(token_ids)
+    return self.sp_model.DecodeIds(token_ids)
+
+  def piece_to_id(self, piece: str) -> int:
+    """Returns the id of the given piece."""
+    return self.sp_model.PieceToId(piece)
+
+  def id_to_piece(self, token_id: int) -> str:
+    """Returns the piece of the given id."""
+    return self.sp_model.IdToPiece(token_id)
+
+
+class ByteVocabulary(SimplyVocab[str]):
+  """A simple byte-level vocabulary.
+
+  This is a drop-in replacement for seqio.ByteVocabulary, useful for testing.
+  Each byte (0-255) maps to a token id, with special tokens added after.
+  """
+
+  def __init__(self):
+    # Special tokens are placed after the byte range
+    self._num_bytes = 256
+    self._pad_id = self._num_bytes
+    self._eos_id = self._num_bytes + 1
+    self._bos_id = self._num_bytes + 2
+    self._unk_id = self._num_bytes + 3
+
+  @property
+  def vocab_size(self) -> int:
+    return self._num_bytes + 4  # 256 bytes + pad, eos, bos, unk
+
+  @property
+  def pad_id(self) -> int:
+    return self._pad_id
+
+  @property
+  def eos_id(self) -> int:
+    return self._eos_id
+
+  @property
+  def bos_id(self) -> int:
+    return self._bos_id
+
+  @property
+  def unk_id(self) -> int:
+    return self._unk_id
+
+  def encode(self, text: str) -> list[int]:
+    """Encode text to byte token ids."""
+    return list(text.encode('utf-8'))
+
+  def decode(self, token_ids: list[int]) -> str:
+    """Decode byte token ids to text."""
+    # Filter out special tokens and invalid byte values
+    bytes_list = [
+        tid for tid in token_ids
+        if 0 <= tid < self._num_bytes
+    ]
+    return bytes(bytes_list).decode('utf-8', errors='replace')
 
 
 class HuggingFaceVocab(SimplyVocab[str]):

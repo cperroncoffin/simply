@@ -14,10 +14,13 @@ dependencies = [
     "orbax>=0.1.9",
     "pylatexenc>=2.10",
     "pytest>=9.0.2",
-    "seqio>=0.0.20",
+    "sentencepiece>=0.2.0",
     "sympy>=1.14.0",
-    "t5>=0.9.4",
+    "tensorflow>=2.15.0",
     "tensorboard>=2.19.0,<2.20",
+    "tensorflow-datasets>=4.9.0",
+    "tokenizers>=0.15.0",
+    "pandas>=2.3.3",
 ]
 
 

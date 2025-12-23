@@ -21,7 +21,6 @@ from typing import TypedDict
 from absl.testing import absltest
 from etils import epath
 import numpy as np
-import seqio
 from simply import config_lib
 from simply import data_lib
 from simply import rl_lib
@@ -106,7 +105,7 @@ class RunExperimentTest(absltest.TestCase):
 
   def setUp(self) -> None:
     super().setUp()
-    self._mock_vocab = seqio.ByteVocabulary()
+    self._mock_vocab = tokenization.ByteVocabulary()
     tokenization.TokenizerRegistry.register_value(
         self._mock_vocab, name=_MOCK_VOCAB_NAME
     )
