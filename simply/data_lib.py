@@ -16,10 +16,12 @@ r"""Utilities for dataset creation.
 
 import dataclasses
 import functools
+import glob as glob_module
 import json
 import os
 from typing import Any, Callable, ClassVar, Iterator, Mapping, MutableMapping, Protocol, Union
 
+import datasets as hf_datasets
 import einops
 from etils import epath
 import grain.python as grain
@@ -29,8 +31,6 @@ import numpy as np
 from simply.utils import common
 from simply.utils import registry
 from simply.utils import tokenization
-import tensorflow as tf
-import tensorflow_datasets as tfds
 
 ################################################################################
 # Type aliases.
@@ -176,337 +176,155 @@ class LMFeatureConverter(grain.MapTransform):
 # Grain-based Data Sources.
 
 
-class TFDSDataSource:
-  """Grain-compatible data source for TensorFlow Datasets."""
+class HuggingFaceDataSource:
+  """Grain-compatible data source for HuggingFace Datasets."""
 
   def __init__(
       self,
-      tfds_name: str,
+      dataset_name: str,
       split: str = 'train',
       text_key: str = 'text',
-      data_dir: str | None = None,
+      config_name: str | None = None,
+      cache_dir: str | None = None,
+      trust_remote_code: bool = False,
   ):
-    self.tfds_name = tfds_name
+    self.dataset_name = dataset_name
     self.split = split
     self.text_key = text_key
-    self.data_dir = data_dir
+    self.config_name = config_name
+    self.cache_dir = cache_dir
+    self.trust_remote_code = trust_remote_code
     self._dataset = None
-    self._length = None
 
   def _load_dataset(self):
     if self._dataset is None:
-      self._dataset = tfds.load(
-          self.tfds_name,
+      self._dataset = hf_datasets.load_dataset(
+          self.dataset_name,
+          name=self.config_name,
           split=self.split,
-          data_dir=self.data_dir,
-          shuffle_files=False,
+          cache_dir=self.cache_dir,
+          trust_remote_code=self.trust_remote_code,
       )
-      # Get length
-      self._length = self._dataset.cardinality().numpy()
-      if self._length == tf.data.UNKNOWN_CARDINALITY:
-        # Count manually if cardinality is unknown
-        self._length = sum(1 for _ in self._dataset)
 
   def __len__(self) -> int:
     self._load_dataset()
-    return self._length
+    return len(self._dataset)
 
   def __getitem__(self, index: int) -> dict[str, Any]:
     self._load_dataset()
-    # Skip to the index and get one element
-    element = next(iter(self._dataset.skip(index).take(1)))
-    return {self.text_key: element[self.text_key].numpy()}
+    example = self._dataset[index]
+    text = example[self.text_key]
+    if isinstance(text, bytes):
+      text = text.decode('utf-8')
+    return {self.text_key: text}
 
 
-class TFRecordDataSource:
-  """Grain-compatible data source for TFRecord files."""
+class ParquetDataSource:
+  """Grain-compatible data source for Parquet files."""
 
   def __init__(
       self,
       file_pattern: str,
-      feature_description: dict[str, tf.io.FixedLenFeature],
       text_key: str = 'text',
+      text_preprocessor: Callable[[str], str] | None = None,
   ):
     self.file_pattern = file_pattern
-    self.feature_description = feature_description
     self.text_key = text_key
-    self._files = None
+    self.text_preprocessor = text_preprocessor
     self._dataset = None
-    self._length = None
+    self._files = None
 
   def _load_dataset(self):
     if self._dataset is None:
-      self._files = tf.io.gfile.glob(self.file_pattern)
-      self._dataset = tf.data.TFRecordDataset(self._files)
-      # Get length
-      self._length = self._dataset.cardinality().numpy()
-      if self._length == tf.data.UNKNOWN_CARDINALITY:
-        # Count manually if cardinality is unknown
-        self._length = sum(1 for _ in self._dataset)
+      self._files = sorted(glob_module.glob(self.file_pattern))
+      if not self._files:
+        raise ValueError(f'No files found matching pattern: {self.file_pattern}')
+      # Load all parquet files into a single HF dataset
+      self._dataset = hf_datasets.load_dataset(
+          'parquet',
+          data_files=self._files,
+          split='train',
+      )
 
   def __len__(self) -> int:
     self._load_dataset()
-    return self._length
+    return len(self._dataset)
 
   def __getitem__(self, index: int) -> dict[str, Any]:
     self._load_dataset()
-    # Skip to the index and get one element
-    raw_record = next(iter(self._dataset.skip(index).take(1)))
-    parsed = tf.io.parse_single_example(raw_record, self.feature_description)
-    return {self.text_key: parsed[self.text_key].numpy()}
+    example = self._dataset[index]
+    text = example[self.text_key]
+    if isinstance(text, bytes):
+      text = text.decode('utf-8')
+    if self.text_preprocessor is not None:
+      text = self.text_preprocessor(text)
+    return {'text': text}
 
 
-class TFDataIterDataset(grain.IterDataset[dict[str, Any]]):
-  """Wraps a tf.data.Dataset as a Grain IterDataset for efficient streaming."""
-
-  def __init__(
-      self,
-      create_tf_dataset_fn: Callable[[], tf.data.Dataset],
-      vocab: tokenization.SentencePieceVocabulary,
-      seq_len: int,
-      batch_size: int,
-      bos_id: int = 0,
-      add_eos: bool = False,
-      shuffle: bool = True,
-      seed: int | None = None,
-      num_epochs: int | None = None,
-  ):
-    super().__init__()
-    self._create_tf_dataset_fn = create_tf_dataset_fn
-    self._vocab = vocab
-    self._seq_len = seq_len
-    self._batch_size = batch_size
-    self._bos_id = bos_id
-    self._add_eos = add_eos
-    self._shuffle = shuffle
-    self._seed = seed
-    self._num_epochs = num_epochs
-    self._num_workers = 1
-    self._worker_index = 0
-
-  def set_slice(self, sl: slice, sequential_slice: bool = False) -> None:
-    del sequential_slice
-    assert sl.stop is None, f'{sl=}'
-    self._num_workers = sl.step
-    self._worker_index = sl.start
-
-  def __iter__(self) -> Iterator[dict[str, Any]]:
-    return _TFDataIterator(
-        create_tf_dataset_fn=self._create_tf_dataset_fn,
-        vocab=self._vocab,
-        seq_len=self._seq_len,
-        batch_size=self._batch_size,
-        bos_id=self._bos_id,
-        add_eos=self._add_eos,
-        shuffle=self._shuffle,
-        seed=self._seed,
-        num_epochs=self._num_epochs,
-        worker_index=self._worker_index,
-        num_workers=self._num_workers,
-    )
-
-
-class _TFDataIterator(grain.DatasetIterator[dict[str, Any]]):
-  """Iterator for TFDataIterDataset."""
+class JSONLDataSource:
+  """Grain-compatible data source for JSONL files."""
 
   def __init__(
       self,
-      create_tf_dataset_fn: Callable[[], tf.data.Dataset],
-      vocab: tokenization.SentencePieceVocabulary,
-      seq_len: int,
-      batch_size: int,
-      bos_id: int = 0,
-      add_eos: bool = False,
-      shuffle: bool = True,
-      seed: int | None = None,
-      num_epochs: int | None = None,
-      worker_index: int = 0,
-      num_workers: int = 1,
+      file_pattern: str,
+      text_key: str = 'text',
+      text_preprocessor: Callable[[str], str] | None = None,
   ):
-    super().__init__()
-    self._create_tf_dataset_fn = create_tf_dataset_fn
-    self._vocab = vocab
-    self._seq_len = seq_len
-    self._batch_size = batch_size
-    self._bos_id = bos_id
-    self._add_eos = add_eos
-    self._shuffle = shuffle
-    self._seed = seed
-    self._num_epochs = num_epochs
-    self._worker_index = worker_index
-    self._num_workers = num_workers
-    self._iterator = None
-    self._example_counter = 0
+    self.file_pattern = file_pattern
+    self.text_key = text_key
+    self.text_preprocessor = text_preprocessor
+    self._dataset = None
+    self._files = None
 
-  def _tokenize_and_convert(self, example: dict[str, tf.Tensor]) -> dict[str, tf.Tensor]:
-    """Tokenize text and convert to LM format."""
-    def py_tokenize(text_bytes):
-      text = text_bytes.numpy().decode('utf-8')
-      tokens = self._vocab.encode(text)
-      if self._add_eos and self._vocab.eos_id is not None:
-        tokens = tokens + [self._vocab.eos_id]
-      return np.array(tokens, dtype=np.int32)
+  def _load_dataset(self):
+    if self._dataset is None:
+      self._files = sorted(glob_module.glob(self.file_pattern))
+      if not self._files:
+        raise ValueError(f'No files found matching pattern: {self.file_pattern}')
+      # Load all JSONL files into a single HF dataset
+      self._dataset = hf_datasets.load_dataset(
+          'json',
+          data_files=self._files,
+          split='train',
+      )
 
-    tokens = tf.py_function(py_tokenize, [example['text']], tf.int32)
-    return {'targets': tokens}
+  def __len__(self) -> int:
+    self._load_dataset()
+    return len(self._dataset)
 
-  def _pad_and_convert_to_lm(self, example: dict[str, tf.Tensor]) -> dict[str, tf.Tensor]:
-    """Pad/truncate and convert to LM format."""
-    targets = example['targets']
-    # Truncate or pad
-    targets = targets[:self._seq_len]
-    padding = tf.zeros([self._seq_len - tf.shape(targets)[0]], dtype=tf.int32)
-    targets = tf.concat([targets, padding], axis=0)
-    targets.set_shape([self._seq_len])
-
-    # Create decoder format
-    decoder_input_tokens = tf.concat([[self._bos_id], targets[:-1]], axis=0)
-    decoder_target_tokens = targets
-    decoder_loss_weights = tf.cast(decoder_target_tokens != 0, tf.float32)
-
-    return {
-        'decoder_input_tokens': decoder_input_tokens,
-        'decoder_target_tokens': decoder_target_tokens,
-        'decoder_loss_weights': decoder_loss_weights,
-    }
-
-  def _create_iterator(self):
-    ds = self._create_tf_dataset_fn()
-
-    # Shard across workers
-    if self._num_workers > 1:
-      ds = ds.shard(num_shards=self._num_workers, index=self._worker_index)
-
-    # Shuffle if requested
-    if self._shuffle:
-      seed = self._seed if self._seed is not None else 42
-      ds = ds.shuffle(buffer_size=10000, seed=seed + self._worker_index)
-
-    # Repeat for epochs
-    if self._num_epochs is None:
-      ds = ds.repeat()
-    else:
-      ds = ds.repeat(self._num_epochs)
-
-    # Tokenize and convert to LM format
-    ds = ds.map(self._tokenize_and_convert, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.map(self._pad_and_convert_to_lm, num_parallel_calls=tf.data.AUTOTUNE)
-
-    # Batch
-    ds = ds.batch(self._batch_size, drop_remainder=True)
-
-    # Prefetch
-    ds = ds.prefetch(tf.data.AUTOTUNE)
-
-    # Disable autotune for multiprocessing compatibility
-    options = tf.data.Options()
-    options.autotune.enabled = False
-    options.threading.max_intra_op_parallelism = 1
-    options.threading.private_threadpool_size = 1
-    ds = ds.with_options(options)
-
-    return iter(ds.as_numpy_iterator())
-
-  def __next__(self) -> dict[str, Any]:
-    if self._iterator is None:
-      self._iterator = self._create_iterator()
-      # Skip to restore position
-      for _ in range(self._example_counter):
-        next(self._iterator)
-
-    self._example_counter += 1
-    return next(self._iterator)
-
-  def get_state(self) -> dict[str, Any]:
-    return {'example_counter': self._example_counter}
-
-  def set_state(self, state: dict[str, Any]) -> None:
-    self._example_counter = state['example_counter']
-    self._iterator = None
+  def __getitem__(self, index: int) -> dict[str, Any]:
+    self._load_dataset()
+    example = self._dataset[index]
+    text = example[self.text_key]
+    if isinstance(text, bytes):
+      text = text.decode('utf-8')
+    if self.text_preprocessor is not None:
+      text = self.text_preprocessor(text)
+    return {'text': text}
 
 
 ################################################################################
 # Dataset Registry for PT and SFT Datasets.
 
 
-def _create_tfds_dataset_fn(tfds_name: str, split: str):
-  """Create a function that returns a tf.data.Dataset from TFDS."""
-  def create_fn():
-    ds = tfds.load(tfds_name, split=split, shuffle_files=False)
-    return ds
-  return create_fn
-
-
-def _create_tfrecord_dataset_fn(
-    file_pattern: str,
-    feature_description: dict[str, tf.io.FixedLenFeature],
-):
-  """Create a function that returns a tf.data.Dataset from TFRecords."""
-  def create_fn():
-    files = tf.io.gfile.glob(file_pattern)
-    ds = tf.data.TFRecordDataset(files)
-    ds = ds.map(
-        lambda x: tf.io.parse_single_example(x, feature_description),
-        num_parallel_calls=tf.data.AUTOTUNE
-    )
-    return ds
-  return create_fn
-
-
-# Dataset configurations: maps dataset_name -> (create_fn_factory, vocab_list)
-_DATASET_CONFIGS: dict[str, tuple[Callable, list[tuple[str, str]]]] = {}
-
-
-def _register_tfds_dataset(
-    base_name: str,
-    tfds_name: str,
-    splits: dict[str, str],
-    vocabs: list[tuple[str, str]],
-):
-  """Register a TFDS-based dataset."""
-  for vocab_name, vocab_path in vocabs:
-    dataset_name = f'{base_name}.{vocab_name}'
-    _DATASET_CONFIGS[dataset_name] = (
-        lambda tfds_name=tfds_name, splits=splits: (tfds_name, splits),
-        vocab_path,
-        'tfds',
-    )
-
-
-def _register_tfrecord_dataset(
-    base_name: str,
-    file_patterns: dict[str, str],
-    feature_description: dict[str, tf.io.FixedLenFeature],
-    vocabs: list[tuple[str, str]],
-):
-  """Register a TFRecord-based dataset."""
-  for vocab_name, vocab_path in vocabs:
-    dataset_name = f'{base_name}.{vocab_name}'
-    _DATASET_CONFIGS[dataset_name] = (
-        file_patterns,
-        feature_description,
-        vocab_path,
-        'tfrecord',
-    )
-
-
-# Register TFDS datasets
-_TFDS_DATASETS = [
-    ('lm1b', 'lm1b:1.1.0', {
+# Register HuggingFace datasets
+# Format: (name, hf_dataset_name, hf_config, splits, vocabs)
+_HF_DATASETS = [
+    ('lm1b', 'lm1b', None, {
         'train': 'train[:90%]',
         'validation': 'train[90%:]',
         'test': 'test'
     }, OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + [('vb32768_openmix_v1', OPENMIX_V1_32768_VOCAB)]),
-    ('minilm1b', 'lm1b:1.1.0', {
+    ('minilm1b', 'lm1b', None, {
         'train': 'train[:500]',
         'validation': 'train[500:1000]',
         'test': 'test'
     }, OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + [('vb32768_openmix_v1', OPENMIX_V1_32768_VOCAB)]),
-    ('c4', 'c4:3.0.1', {
+    ('c4', 'allenai/c4', 'en', {
         'train': 'train',
         'validation': 'validation',
     }, OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS),
-    ('imdb_reviews', 'imdb_reviews/plain_text:1.0.0', {
+    ('imdb_reviews', 'imdb', 'plain_text', {
         'train': 'train[:90%]',
         'validation': 'train[90%:]',
         'test': 'test'
@@ -790,11 +608,11 @@ def create_simple_dataset(
   )
 
 
-def _get_dataset_info(dataset_name: str) -> tuple[str, str, str, dict[str, str]]:
-  """Parse dataset name and return (base_name, vocab_name, ds_type, splits).
+def _get_dataset_info(dataset_name: str) -> tuple[str, str, str, Any]:
+  """Parse dataset name and return (base_name, vocab_name, ds_type, info).
 
   Dataset name format: <base_name>.<vocab_name>
-  Returns: base_name, vocab_name, dataset_type ('tfds' or 'tfrecord'), splits
+  Returns: base_name, vocab_name, dataset_type ('huggingface' or 'file'), info
   """
   parts = dataset_name.rsplit('.', 1)
   if len(parts) != 2:
@@ -802,127 +620,123 @@ def _get_dataset_info(dataset_name: str) -> tuple[str, str, str, dict[str, str]]
                      'Expected format: <base_name>.<vocab_name>')
   base_name, vocab_name = parts
 
-  # Check TFDS datasets
-  for name, tfds_name, splits, vocabs in _TFDS_DATASETS:
+  # Check HuggingFace datasets
+  for name, hf_name, hf_config, splits, vocabs in _HF_DATASETS:
     for vname, _ in vocabs:
       if name == base_name and vname == vocab_name:
-        return base_name, vocab_name, 'tfds', tfds_name, splits
+        return base_name, vocab_name, 'huggingface', (hf_name, hf_config, splits)
 
-  # Check TFRecord datasets
-  tfrecord_configs = _get_tfrecord_configs()
-  for name, config in tfrecord_configs.items():
+  # Check file-based datasets (parquet/jsonl)
+  file_configs = _get_file_configs()
+  for name, config in file_configs.items():
     if name == base_name:
       for vname, _ in config['vocabs']:
         if vname == vocab_name:
-          return base_name, vocab_name, 'tfrecord', config
+          return base_name, vocab_name, 'file', config
 
   raise ValueError(f'Unknown dataset: {dataset_name}')
 
 
-def _get_tfrecord_configs() -> dict[str, dict]:
-  """Return TFRecord dataset configurations."""
+def _get_file_configs() -> dict[str, dict]:
+  """Return file-based dataset configurations (parquet/jsonl).
+
+  NOTE: These dataset paths have been updated from TFRecord format to parquet/jsonl.
+  You may need to convert your existing TFRecord datasets to parquet format.
+  """
   return {
       'the_pile_lm': {
           'file_patterns': {
-              'train': os.path.join(DATASETS_DIR, 'pile/pile_tfrecord/train.tfrecord*'),
-              'validation': os.path.join(DATASETS_DIR, 'pile/pile_tfrecord/val.tfrecord*'),
-              'test': os.path.join(DATASETS_DIR, 'pile/pile_tfrecord/test.tfrecord*'),
+              'train': os.path.join(DATASETS_DIR, 'pile/parquet/train*.parquet'),
+              'validation': os.path.join(DATASETS_DIR, 'pile/parquet/val*.parquet'),
+              'test': os.path.join(DATASETS_DIR, 'pile/parquet/test*.parquet'),
           },
-          'feature_description': {
-              'text': tf.io.FixedLenFeature([], dtype=tf.string),
-          },
+          'file_type': 'parquet',
           'vocabs': PILE_VOCABS,
       },
       'redpajama_1t_arxiv': {
           'file_patterns': {
-              'train': os.path.join(DATASETS_DIR, 'redpajama_1t/tfrecord/arxiv.tfrecord*'),
+              'train': os.path.join(DATASETS_DIR, 'redpajama_1t/parquet/arxiv*.parquet'),
           },
-          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'file_type': 'parquet',
           'vocabs': OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS,
       },
       'redpajama_1t_wikipedia': {
           'file_patterns': {
-              'train': os.path.join(DATASETS_DIR, 'redpajama_1t/tfrecord/wikipedia.tfrecord*'),
+              'train': os.path.join(DATASETS_DIR, 'redpajama_1t/parquet/wikipedia*.parquet'),
           },
-          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'file_type': 'parquet',
           'vocabs': OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS,
       },
       'redpajama_1t_book': {
           'file_patterns': {
-              'train': os.path.join(DATASETS_DIR, 'redpajama_1t/tfrecord/book.tfrecord*'),
+              'train': os.path.join(DATASETS_DIR, 'redpajama_1t/parquet/book*.parquet'),
           },
-          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'file_type': 'parquet',
           'vocabs': OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS,
       },
       'redpajama_1t_stackexchange': {
           'file_patterns': {
-              'train': os.path.join(DATASETS_DIR, 'redpajama_1t/tfrecord/stackexchange.tfrecord*'),
+              'train': os.path.join(DATASETS_DIR, 'redpajama_1t/parquet/stackexchange*.parquet'),
           },
-          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'file_type': 'parquet',
           'vocabs': OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS,
       },
       'starcoder': {
           'file_patterns': {
-              'train': os.path.join(DATASETS_DIR, 'starcoder/tfrecord/train.tfrecord*'),
+              'train': os.path.join(DATASETS_DIR, 'starcoder/parquet/train*.parquet'),
           },
-          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'file_type': 'parquet',
           'vocabs': OPENMIX_V1_VOCABS,
       },
       'refinedweb': {
           'file_patterns': {
-              'train': os.path.join(DATASETS_DIR, 'refinedweb/tfrecord/train.tfrecord*'),
+              'train': os.path.join(DATASETS_DIR, 'refinedweb/parquet/train*.parquet'),
           },
-          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'file_type': 'parquet',
           'vocabs': OPENMIX_V1_VOCABS,
       },
       'fineweb_edu': {
           'file_patterns': {
-              'train': os.path.join(DATASETS_DIR, 'fineweb-edu/train1.tfrecord-*'),
+              'train': os.path.join(DATASETS_DIR, 'fineweb-edu/parquet/train*.parquet'),
           },
-          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'file_type': 'parquet',
           'vocabs': [['fwedu_100864_v1', FWEDU_100864_V1_VOCAB]] + OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS,
       },
       'dclm_baseline_1p0': {
           'file_patterns': {
-              'train': os.path.join(DATASETS_DIR, 'dclm-baseline-1p0/tfrecords/*/*'),
+              'train': os.path.join(DATASETS_DIR, 'dclm-baseline-1p0/parquet/**/*.parquet'),
           },
-          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'file_type': 'parquet',
           'vocabs': OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS,
       },
       'stack_v2_smol_repo': {
           'file_patterns': {
-              'train': os.path.join(DATASETS_DIR, 'stack_v2/download/train-smol-1/train1.tfrecord*'),
+              'train': os.path.join(DATASETS_DIR, 'stack_v2/parquet/train-smol-1/*.parquet'),
           },
-          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'file_type': 'parquet',
           'vocabs': OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS,
       },
       'stack_v2_smol_file': {
           'file_patterns': {
-              'train': os.path.join(DATASETS_DIR, 'stack_v2/download/train-smol-1-file/train2.tfrecord*'),
+              'train': os.path.join(DATASETS_DIR, 'stack_v2/parquet/train-smol-1-file/*.parquet'),
           },
-          'feature_description': {'text': tf.io.FixedLenFeature([], dtype=tf.string)},
+          'file_type': 'parquet',
           'vocabs': OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS,
       },
       'openhermes_2p5': {
           'file_patterns': {
-              'train': os.path.join(DATASETS_DIR, 'openhermes-2p5/train.tfrecord'),
+              'train': os.path.join(DATASETS_DIR, 'openhermes-2p5/train.jsonl'),
           },
-          'feature_description': {
-              'conversation': tf.io.FixedLenFeature([], dtype=tf.string),
-              'metadata': tf.io.FixedLenFeature([], dtype=tf.string),
-          },
+          'file_type': 'jsonl',
           'vocabs': OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS + OPENMIX_V3_VOCABS,
           'text_key': 'conversation',
           'text_preprocessor': process_conversation,
       },
       'tulu_v2_sft': {
           'file_patterns': {
-              'train': os.path.join(DATASETS_DIR, 'tulu-v2-sft-mixture/train.tfrecord'),
+              'train': os.path.join(DATASETS_DIR, 'tulu-v2-sft-mixture/train.jsonl'),
           },
-          'feature_description': {
-              'conversation': tf.io.FixedLenFeature([], dtype=tf.string),
-              'metadata': tf.io.FixedLenFeature([], dtype=tf.string),
-          },
+          'file_type': 'jsonl',
           'vocabs': OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS,
           'text_key': 'conversation',
           'text_preprocessor': process_conversation,
@@ -945,8 +759,8 @@ def create_iter_dataset(
 
   This function supports:
   - simply_json:* datasets (JSON-based, uses create_simple_dataset)
-  - TFDS-based datasets (lm1b, c4, imdb_reviews, etc.)
-  - TFRecord-based datasets (pile, redpajama, starcoder, etc.)
+  - HuggingFace datasets (lm1b, c4, imdb_reviews, etc.)
+  - File-based datasets in parquet/jsonl format
   """
   dataset_name = config.dataset_name
   batch_size = config.batch_size
@@ -971,15 +785,15 @@ def create_iter_dataset(
     )
 
   # Parse dataset name
-  base_name, vocab_name, ds_type, *ds_info = _get_dataset_info(dataset_name)
+  base_name, vocab_name, ds_type, ds_info = _get_dataset_info(dataset_name)
 
   # Get vocab
   bos_id = getattr(config, 'bos_id', 0)
 
-  if ds_type == 'tfds':
-    tfds_name, splits = ds_info
+  if ds_type == 'huggingface':
+    hf_name, hf_config, splits = ds_info
     # Find vocab path
-    for name, tfds_n, sp, vocabs in _TFDS_DATASETS:
+    for name, hf_n, hf_c, sp, vocabs in _HF_DATASETS:
       if name == base_name:
         vocab_path = _get_vocab_path(vocab_name, vocabs)
         break
@@ -988,78 +802,76 @@ def create_iter_dataset(
     # Get the split string
     split_str = splits.get(split, split)
 
-    # Create tf.data.Dataset function
-    def create_tfds_fn(tfds_name=tfds_name, split_str=split_str):
-      return tfds.load(tfds_name, split=split_str, shuffle_files=False)
-
-    dataset = TFDataIterDataset(
-        create_tf_dataset_fn=create_tfds_fn,
-        vocab=vocab,
-        seq_len=config.seq_len,
-        batch_size=batch_size,
-        bos_id=bos_id,
-        add_eos=True,
-        shuffle=shuffle,
-        seed=config.dataset_seed,
-        num_epochs=num_epochs,
+    # Create HuggingFace data source
+    data_source = HuggingFaceDataSource(
+        dataset_name=hf_name,
+        split=split_str,
+        text_key='text',
+        config_name=hf_config,
     )
 
-  elif ds_type == 'tfrecord':
-    tfrecord_config = ds_info[0]
-    vocab_path = _get_vocab_path(vocab_name, tfrecord_config['vocabs'])
+  elif ds_type == 'file':
+    file_config = ds_info
+    vocab_path = _get_vocab_path(vocab_name, file_config['vocabs'])
     vocab = tokenization.SentencePieceVocabulary(vocab_path)
 
-    file_pattern = tfrecord_config['file_patterns'].get(split)
+    file_pattern = file_config['file_patterns'].get(split)
     if file_pattern is None:
       raise ValueError(f'Split {split} not available for dataset {base_name}')
 
-    feature_description = tfrecord_config['feature_description']
-    text_key = tfrecord_config.get('text_key', 'text')
-    text_preprocessor = tfrecord_config.get('text_preprocessor', None)
+    file_type = file_config.get('file_type', 'parquet')
+    text_key = file_config.get('text_key', 'text')
+    text_preprocessor = file_config.get('text_preprocessor', None)
 
-    # Create tf.data.Dataset function
-    def create_tfrecord_fn(
-        file_pattern=file_pattern,
-        feature_description=feature_description,
-        text_key=text_key,
-        text_preprocessor=text_preprocessor,
-    ):
-      files = tf.io.gfile.glob(file_pattern)
-      ds = tf.data.TFRecordDataset(files)
-      ds = ds.map(
-          lambda x: tf.io.parse_single_example(x, feature_description),
-          num_parallel_calls=tf.data.AUTOTUNE
+    # Create file-based data source
+    if file_type == 'parquet':
+      data_source = ParquetDataSource(
+          file_pattern=file_pattern,
+          text_key=text_key,
+          text_preprocessor=text_preprocessor,
       )
-      # Rename key to 'text' if needed
-      if text_key != 'text':
-        def preprocess(example):
-          text_value = example[text_key]
-          if text_preprocessor is not None:
-            # Apply text preprocessor
-            def py_preprocess(text_bytes):
-              text = text_bytes.numpy().decode('utf-8')
-              return text_preprocessor(text)
-            text_value = tf.py_function(py_preprocess, [text_value], tf.string)
-          return {'text': text_value}
-        ds = ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
-      return ds
-
-    dataset = TFDataIterDataset(
-        create_tf_dataset_fn=create_tfrecord_fn,
-        vocab=vocab,
-        seq_len=config.seq_len,
-        batch_size=batch_size,
-        bos_id=bos_id,
-        add_eos=True,
-        shuffle=shuffle,
-        seed=config.dataset_seed,
-        num_epochs=num_epochs,
-    )
+    elif file_type == 'jsonl':
+      data_source = JSONLDataSource(
+          file_pattern=file_pattern,
+          text_key=text_key,
+          text_preprocessor=text_preprocessor,
+      )
+    else:
+      raise ValueError(f'Unknown file type: {file_type}')
 
   else:
     raise ValueError(f'Unknown dataset type: {ds_type}')
 
-  return dataset.mp_prefetch(
+  # Build Grain pipeline
+  dataset = grain.MapDataset.source(data_source)
+
+  # Apply tokenization transform
+  dataset = dataset.map(TokenizeTransform(
+      vocab=vocab,
+      text_key='text',
+      add_eos=True,
+      add_bos=False,
+  ))
+
+  # Apply LM feature converter
+  dataset = dataset.map(LMFeatureConverter(
+      seq_len=config.seq_len,
+      bos_id=bos_id,
+  ))
+
+  # Shuffle if needed
+  if shuffle:
+    dataset = dataset.shuffle(seed=config.dataset_seed)
+
+  # Repeat and batch
+  dataset = (
+      dataset
+      .repeat(num_epochs)
+      .batch(batch_size, drop_remainder=True)
+  )
+
+  # Convert to IterDataset and add multiprocessing prefetch
+  return dataset.to_iter_dataset().mp_prefetch(
       grain.MultiprocessingOptions(
           num_workers=config.prefetch_num_workers,
           per_worker_buffer_size=config.prefetch_per_worker_buffer_size,

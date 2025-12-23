@@ -21,7 +21,6 @@ import json
 import logging
 from typing import Any, Mapping, Protocol
 
-from clu import metric_writers
 from etils import epath
 import jax
 import numpy as np
@@ -251,6 +250,15 @@ class ExperimentHelper:
       )
     else:
       # Default to tensorboard (clu metric_writers)
+      # Lazy import to avoid TensorFlow dependency when using wandb
+      try:
+        from clu import metric_writers
+      except ImportError:
+        raise ImportError(
+            'clu is required for tensorboard logging. '
+            'Install it with: pip install clu tensorflow. '
+            'Alternatively, use metric_writer_type="wandb" to avoid this dependency.'
+        )
       metric_logdir = epath.Path(self.metric_logdir)
       metric_logdir.mkdir(parents=True, exist_ok=True)
       writer = metric_writers.create_default_writer(
